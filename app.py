@@ -1,4 +1,4 @@
-# app.py — Crypto Monitor (adaptive risk, 0–100 sentiment, ARIMA, optional Google Sheets logging)
+# app.py — Crypto Monitor (robust dollar volume + adaptive risk + 0–100 sentiment + ARIMA + optional Google Sheets logging)
 
 from __future__ import annotations
 import time, re, warnings, json
@@ -169,7 +169,7 @@ def _reconcile_logs(ws, ex_id: str):
             if r.get("kind")!="forecast" or r.get("status"):
                 continue
             due_ts = pd.to_datetime(r.get("due_ts_utc",""), utc=True, errors="coerce")
-            if pd.isna(due_ts) or now < due_ts: 
+            if pd.isna(due_ts) or now < due_ts:
                 continue
             symbol = r.get("symbol",""); tf = r.get("horizon_tf","1h")
             try:
@@ -195,21 +195,6 @@ def make_exchange(ex_id: str):
     ex.load_markets(); return ex
 
 @st.cache_data(show_spinner=False)
-def top_symbols_by_dollar_volume(ex_id: str, quote: str, _ttl_key:int, top_n: int=40) -> List[str]:
-    ex = make_exchange(ex_id)
-    syms = [s for s,m in ex.markets.items()
-            if m.get("spot") and m.get("active") and m.get("quote","").upper()==quote.upper()]
-    if not syms: return []
-    tickers = ex.fetch_tickers(syms)
-    rows=[]
-    for sym,t in tickers.items():
-        last = t.get("last") or t.get("close") or 0
-        base_vol = t.get("baseVolume") or 0
-        rows.append((sym, (last or 0)*(base_vol or 0)))
-    rows.sort(key=lambda x:x[1], reverse=True)
-    return [s for s,_ in rows[:top_n]]
-
-@st.cache_data(show_spinner=False)
 def fetch_ohlcv_df(ex_id: str, symbol: str, timeframe: str, limit: int, _ttl_key:int) -> pd.DataFrame:
     ex = make_exchange(ex_id)
     o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -220,6 +205,50 @@ def fetch_ohlcv_df(ex_id: str, symbol: str, timeframe: str, limit: int, _ttl_key
 @st.cache_data(show_spinner=False)
 def fetch_ticker(ex_id: str, symbol: str, _ttl_key:int) -> Dict:
     return make_exchange(ex_id).fetch_ticker(symbol)
+
+# ---- robust dollar volume estimator (prevents $0) ----
+@st.cache_data(show_spinner=False)
+def estimate_dollar_volume(ex_id: str, symbol: str, ticker: Dict, timeframe: str="1h", bars:int=48, _ttl_key:int=0) -> float:
+    """
+    Try quoteVolume; else baseVolume*last; else sum(close*volume) over recent bars (≈ 2 days on 1h).
+    """
+    try:
+        qv = ticker.get("quoteVolume")
+        if qv and qv > 0:
+            return float(qv)
+    except Exception:
+        pass
+    try:
+        last = float(ticker.get("last") or ticker.get("close") or 0)
+        bv   = float(ticker.get("baseVolume") or 0)
+        if last>0 and bv>0:
+            return last * bv
+    except Exception:
+        pass
+    # fallback to OHLCV
+    try:
+        df = fetch_ohlcv_df(ex_id, symbol, timeframe=timeframe, limit=bars, _ttl_key=_ttl_key)
+        dv = float((df["close"] * df["volume"]).sum())
+        if dv>0: return dv
+    except Exception:
+        pass
+    return 0.0
+
+@st.cache_data(show_spinner=False)
+def top_symbols_by_dollar_volume(ex_id: str, quote: str, _ttl_key:int, top_n: int=40) -> List[str]:
+    ex = make_exchange(ex_id)
+    syms = [s for s,m in ex.markets.items()
+            if m.get("spot") and m.get("active") and m.get("quote","").upper()==quote.upper()]
+    if not syms: return []
+    tickers = ex.fetch_tickers(syms)
+    rows=[]
+    for sym,t in tickers.items():
+        last = t.get("last") or t.get("close") or 0
+        # robust DV
+        dv = estimate_dollar_volume(ex_id, sym, t, timeframe="1h", bars=36, _ttl_key=_ttl_key)
+        rows.append((sym, dv, last))
+    rows.sort(key=lambda x:x[1], reverse=True)
+    return [s for s,_,__ in rows[:top_n]]
 
 @st.cache_data(show_spinner=False)
 def latest_news(cp_token: Optional[str], limit: int, _ttl_key:int) -> List[Dict]:
@@ -351,7 +380,7 @@ def forecast_series(df_xy: pd.DataFrame, periods:int, freq:str) -> pd.DataFrame:
 # =================== Tabs ===================
 tab_overview, tab_live, tab_news, tab_predict = st.tabs(["Overview","Live","News","Predict"])
 
-# cache-busters (respect TTLs)
+# cache-busters
 price_key = int(time.time() // max(1, st.session_state["price_ttl"]))
 news_key  = int(time.time() // max(1, st.session_state["news_ttl"]))
 
@@ -395,14 +424,14 @@ with tab_overview:
         fig.update_layout(title=f"{primary} 1h", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10,r=10,t=36,b=8))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Table rows (no bucket yet)
+    # Table (build rows first — bucket later)
     rows=[]
     for sym in watch:
         try:
             dfi = compute_indicators(fetch_ohlcv_df(exchange_id, sym, "1h", 400, price_key))
             t = fetch_ticker(exchange_id, sym, price_key)
-            last = float(t.get("last") or t.get("close") or dfi["close"].iloc[-1])
-            dv = float((t.get("last") or 0) * (t.get("baseVolume") or 0))
+            last = float(t.get("last") or t.get("close") or (dfi["close"].iloc[-1] if not dfi.empty else 0))
+            dv = estimate_dollar_volume(exchange_id, sym, t, timeframe="1h", bars=36, _ttl_key=price_key)
             score = composite_score(dfi, global_bias)
             atr = float(dfi["atr"].iloc[-1]) if "atr" in dfi else np.nan
             rows.append({
@@ -496,7 +525,11 @@ with tab_live:
     for sym in watch_live:
         try:
             t = fetch_ticker(exchange_id, sym, price_key)
-            rows.append({"Symbol":sym, "Last": float(t.get("last") or t.get("close") or 0), "24h %": t.get("percentage")})
+            dv = estimate_dollar_volume(exchange_id, sym, t, timeframe="1h", bars=36, _ttl_key=price_key)
+            rows.append({"Symbol":sym,
+                        "Last": float(t.get("last") or t.get("close") or 0),
+                        "24h %": t.get("percentage"),
+                        "Dollar Volume": usd(dv)})
         except Exception as e: st.warning(f"{sym}: {e}")
     if rows:
         df=pd.DataFrame(rows); df["Last"]=df["Last"].map(fmt)
