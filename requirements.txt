@@ -8,3 +8,5 @@ vaderSentiment
 ta
 plotly
 statsmodels
+gspread
+google-auth
