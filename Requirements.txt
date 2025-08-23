@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+ccxt
+feedparser
+vaderSentiment
+ta
+plotly
+pmdarima
