@@ -1,7 +1,8 @@
-# app.py — Crypto Monitor (simple UI, adaptive risk, 0–100 sentiment, ARIMA + Google Sheets logging)
+# app.py — Crypto Monitor (simple UI, adaptive risk, 0–100 sentiment, ARIMA, optional Google Sheets logging)
+
 from __future__ import annotations
 
-import time, re, warnings, math, json
+import time, re, warnings, json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -135,7 +136,9 @@ def _open_logs_sheet(sheet_id: str):
     try:
         sa = st.secrets.get("gsheets_service_account", None)
         if not sa: return None
-        if isinstance(sa, str): sa = json.loads(sa)
+        if isinstance(sa, str):
+            try: sa = json.loads(sa)
+            except Exception: return None
         creds = Credentials.from_service_account_info(sa, scopes=['https://www.googleapis.com/auth/spreadsheets'])
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
@@ -146,7 +149,10 @@ def _open_logs_sheet(sheet_id: str):
             ws.append_row(SHEET_HEADERS)
         # ensure headers exist
         if ws.row_values(1) != SHEET_HEADERS:
-            ws.delete_rows(1)
+            try:
+                ws.delete_rows(1)
+            except Exception:
+                pass
             ws.insert_row(SHEET_HEADERS, 1)
         return ws
     except Exception:
@@ -254,7 +260,7 @@ def latest_news(cp_token: Optional[str], limit: int, _ttl_key:int) -> List[Dict]
         except: continue
     return out[:limit]
 
-# =================== Indicators / Scoring ===================
+# =================== Analytics / Scoring ===================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d=df.copy()
     if len(d)<60: return d.assign(sma20=np.nan,sma50=np.nan,rsi14=np.nan,bb_bw=np.nan,atr=np.nan,atr_pct=np.nan)
@@ -266,6 +272,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     atr=ta.volatility.AverageTrueRange(d["high"],d["low"],d["close"],window=14)
     d["atr"]=atr.average_true_range(); d["atr_pct"]=100.0*d["atr"]/d["close"]
     return d
+
+def compute_sentiment_bias(news_items: List[Dict]) -> float:
+    """Weighted average of headline sentiment; weights by |score| to reduce near-neutral noise."""
+    if not news_items: return 0.0
+    num=den=0.0
+    for n in news_items[:100]:
+        w=max(0.1, abs(n.get("sentiment",0.0)))
+        num+=w*n.get("sentiment",0.0); den+=w
+    return num/den if den else 0.0
 
 def composite_score(dfi: pd.DataFrame, news_bias: float=0.0) -> float:
     if dfi.empty or "sma20" not in dfi.columns: return 0.0
@@ -329,7 +344,7 @@ def auto_arima_statsmodels(y: pd.Series, max_p=3, max_d=2, max_q=3) -> Tuple[Tup
             for q in range(max_q+1):
                 if p==q==0 and d==0: continue
                 try:
-                    res=ARIMA(y, order=(p,d,q)).fit()
+                    res=ARIMA(y, order=(p,d,q)).fit()  # safe call, no disp arg
                     if res.aic < (best_aic if best_aic is not None else np.inf):
                         best_aic=res.aic; best=(p,d,q); best_model=res
                 except: continue
@@ -359,13 +374,7 @@ with tab_overview:
 
     # Global sentiment
     news = latest_news(st.session_state["cp_token"], limit=80, _ttl_key=news_key)
-    global_bias = 0.0
-    try:
-        num=den=0.0
-        for n in news:
-            w=max(0.1,abs(n["sentiment"])); num+=w*n["sentiment"]; den+=w
-        global_bias = num/den if den else 0.0
-    except: pass
+    global_bias = compute_sentiment_bias(news)
 
     c1,c2 = st.columns([1,3])
     with c1:
@@ -441,7 +450,11 @@ with tab_overview:
         disp["Entry"] = df["Entry"].map(fmt)
         disp["TP"] = df["TP"].map(fmt)
         disp["SL"] = df["SL"].map(fmt)
-        disp["Score (−1..+1)"] = df["Score (−1..+1)"].map(lambda s: f'<span class="{"badge-pos" if s>=0 else "badge-neg"}">{s:+.3f}</span>')
+        # colorized signed score
+        def _colored(s: float) -> str:
+            cls = "badge-pos" if s >= 0 else "badge-neg"
+            return f'<span class="{cls}">{s:+.3f}</span>'
+        disp["Score (−1..+1)"] = df["Score (−1..+1)"].map(_colored)
         disp["Dollar Volume"] = df["Dollar Volume"].map(usd)
         disp = disp[["Symbol","Risk","Risk Score","Score (0–100)","Score (−1..+1)","Last","ATR","ATR %","Entry","TP","SL","Dollar Volume"]]
         st.markdown(disp.to_html(escape=False, index=False), unsafe_allow_html=True)
@@ -509,8 +522,9 @@ with tab_live:
 with tab_news:
     st.markdown("## News")
     data = latest_news(st.session_state["cp_token"], limit=100, _ttl_key=news_key)
-    st.metric("Global Sentiment (0–100)", f"{to_0_100(composite_score(pd.DataFrame(),0)+0)}")
-    st.metric("Bias (internal)", f"{compute_sentiment_bias(data):+.3f}")
+    bias_here = compute_sentiment_bias(data)
+    st.metric("Global Sentiment (0–100)", f"{to_0_100(bias_here)}")
+    st.metric("Bias (internal)", f"{bias_here:+.3f}")
     for n in data:
         st.write(f"- [{n['title']}]({n['url']}) — {to_0_100(n['sentiment'])}/100")
 
@@ -524,11 +538,7 @@ def coin_bias(symbol: str, news_items: List[Dict]) -> float:
     keys=COIN_ALIASES.get(base,[base.lower()])
     pat=re.compile(r"\b(" + "|".join(map(re.escape, keys)) + r")\b", re.I)
     filt=[n for n in news_items if pat.search(n["title"])]
-    # weighted mean
-    num=den=0.0
-    for n in filt:
-        w=max(0.1,abs(n["sentiment"])); num+=w*n["sentiment"]; den+=w
-    return num/den if den else 0.0
+    return compute_sentiment_bias(filt)
 
 with tab_predict:
     st.markdown("## Predict")
