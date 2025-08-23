@@ -1,7 +1,6 @@
-# app.py — Crypto Monitor (simple UI, adaptive risk, 0–100 sentiment, ARIMA, optional Google Sheets logging)
+# app.py — Crypto Monitor (adaptive risk, 0–100 sentiment, ARIMA, optional Google Sheets logging)
 
 from __future__ import annotations
-
 import time, re, warnings, json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -130,7 +129,6 @@ SHEET_HEADERS = [
 ]
 
 def _open_logs_sheet(sheet_id: str):
-    """Open 'logs' worksheet; create with headers if needed. Returns None if not configured."""
     if not GSHEETS_AVAILABLE or not sheet_id:
         return None
     try:
@@ -147,12 +145,9 @@ def _open_logs_sheet(sheet_id: str):
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title="logs", rows="1000", cols=str(len(SHEET_HEADERS)+2))
             ws.append_row(SHEET_HEADERS)
-        # ensure headers exist
         if ws.row_values(1) != SHEET_HEADERS:
-            try:
-                ws.delete_rows(1)
-            except Exception:
-                pass
+            try: ws.delete_rows(1)
+            except Exception: pass
             ws.insert_row(SHEET_HEADERS, 1)
         return ws
     except Exception:
@@ -161,31 +156,25 @@ def _open_logs_sheet(sheet_id: str):
 def _append_log(ws, row: dict):
     if ws is None: return
     try:
-        vals = [row.get(h,"") for h in SHEET_HEADERS]
-        ws.append_row(vals)
+        ws.append_row([row.get(h,"") for h in SHEET_HEADERS])
     except Exception:
         pass
 
 def _reconcile_logs(ws, ex_id: str):
-    """Fill outcomes for due forecasts: fetch price near due time and mark correct/wrong."""
     if ws is None: return
     try:
         data = ws.get_all_records()
         now = pd.Timestamp.utcnow()
-        for i, r in enumerate(data, start=2):  # row 1 is header
-            if r.get("kind")!="forecast": continue
-            if r.get("status"): continue
-            due = r.get("due_ts_utc","")
-            if not due: continue
-            due_ts = pd.to_datetime(due, utc=True, errors="coerce")
-            if pd.isna(due_ts) or now < due_ts: continue
-            symbol = r.get("symbol","")
-            tf = r.get("horizon_tf","1h")
-            # fetch a window around due time
+        for i, r in enumerate(data, start=2):
+            if r.get("kind")!="forecast" or r.get("status"):
+                continue
+            due_ts = pd.to_datetime(r.get("due_ts_utc",""), utc=True, errors="coerce")
+            if pd.isna(due_ts) or now < due_ts: 
+                continue
+            symbol = r.get("symbol",""); tf = r.get("horizon_tf","1h")
             try:
                 limit = 120 if tf=="15m" else (72 if tf=="1h" else 36)
                 df = fetch_ohlcv_df(ex_id, symbol, timeframe=tf, limit=limit, _ttl_key=int(time.time()))
-                # get candle with timestamp closest to due
                 ts = df.index
                 near = ts[np.argmin(np.abs((ts - due_ts).values))]
                 actual = float(df.loc[near,"close"])
@@ -274,7 +263,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def compute_sentiment_bias(news_items: List[Dict]) -> float:
-    """Weighted average of headline sentiment; weights by |score| to reduce near-neutral noise."""
     if not news_items: return 0.0
     num=den=0.0
     for n in news_items[:100]:
@@ -296,13 +284,12 @@ def bracket_from_atr(entry: float, atr: float, bucket: str) -> Bracket:
     k={"Low":(1.2,0.8),"Medium":(1.8,1.0)}.get(bucket,(2.5,1.2))
     return Bracket(entry, entry + k[0]*atr, entry - k[1]*atr)
 
-# ---- Adaptive risk + Risk Score (0–100) ----
+# ---- ADAPTIVE RISK: quantiles + guardrails (adds 'bucket' and 'risk_score') ----
 def assign_risk(rows: List[dict]) -> List[dict]:
-    """Adaptive buckets; robust to column name differences."""
     if not rows: return rows
     df = pd.DataFrame(rows).copy()
 
-    # normalize names
+    # normalize names we rely on
     if "dollar_volume" not in df.columns and "Dollar Volume" in df.columns:
         df["dollar_volume"] = pd.to_numeric(df["Dollar Volume"], errors="coerce")
     if "atr_pct" not in df.columns and "ATR %" in df.columns:
@@ -344,7 +331,7 @@ def auto_arima_statsmodels(y: pd.Series, max_p=3, max_d=2, max_q=3) -> Tuple[Tup
             for q in range(max_q+1):
                 if p==q==0 and d==0: continue
                 try:
-                    res=ARIMA(y, order=(p,d,q)).fit()  # safe call, no disp arg
+                    res=ARIMA(y, order=(p,d,q)).fit()
                     if res.aic < (best_aic if best_aic is not None else np.inf):
                         best_aic=res.aic; best=(p,d,q); best_model=res
                 except: continue
@@ -364,7 +351,7 @@ def forecast_series(df_xy: pd.DataFrame, periods:int, freq:str) -> pd.DataFrame:
 # =================== Tabs ===================
 tab_overview, tab_live, tab_news, tab_predict = st.tabs(["Overview","Live","News","Predict"])
 
-# cache-busters
+# cache-busters (respect TTLs)
 price_key = int(time.time() // max(1, st.session_state["price_ttl"]))
 news_key  = int(time.time() // max(1, st.session_state["news_ttl"]))
 
@@ -408,7 +395,7 @@ with tab_overview:
         fig.update_layout(title=f"{primary} 1h", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10,r=10,t=36,b=8))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Table
+    # Table rows (no bucket yet)
     rows=[]
     for sym in watch:
         try:
@@ -426,17 +413,17 @@ with tab_overview:
                 "ATR": atr,
                 "atr_pct": float(dfi["atr_pct"].iloc[-1]) if "atr_pct" in dfi else np.nan,
                 "Dollar Volume": dv,
-                "Entry": None, "TP": None, "SL": None,
+                "Entry": None, "TP": None, "SL": None
             })
         except Exception as e:
             st.warning(f"{sym}: {e}")
 
+    # Adaptive risk + brackets
     if rows:
-        # adaptive risk + brackets
         rows = assign_risk(rows)
         for r in rows:
-            bucket = r.get("bucket", "High")
-            if pd.notna(r["ATR"]):
+            bucket = r.get("bucket","High")
+            if pd.notna(r.get("ATR")) and pd.notna(r.get("Last")):
                 br = bracket_from_atr(r["Last"], r["ATR"], bucket)
                 r["Entry"], r["TP"], r["SL"] = br.entry, br.tp, br.sl
 
@@ -450,7 +437,6 @@ with tab_overview:
         disp["Entry"] = df["Entry"].map(fmt)
         disp["TP"] = df["TP"].map(fmt)
         disp["SL"] = df["SL"].map(fmt)
-        # colorized signed score
         def _colored(s: float) -> str:
             cls = "badge-pos" if s >= 0 else "badge-neg"
             return f'<span class="{cls}">{s:+.3f}</span>'
@@ -478,7 +464,6 @@ with tab_overview:
                     st.write(f"{r['Symbol']} — Score {int(r['Score (0–100)'])}/100, Risk {int(r['risk_score'])}/100")
                     st.write(f"Entry {fmt(r['Entry'])} • TP {fmt(r['TP'])} • SL {fmt(r['SL'])}")
                     st.caption(f"Budget {usd(budget)} • Qty ~ {fmt(qty)} • Est fees {usd(fees)}")
-                    # log pick
                     _append_log(ws, {
                         "ts_utc": pd.Timestamp.utcnow().isoformat(),
                         "kind": "pick",
@@ -489,7 +474,6 @@ with tab_overview:
                         "due_ts_utc":"", "status":"", "actual_price":"", "realized_change_pct":"", "correct":""
                     })
 
-        # Reconcile outcomes for forecasts (if any)
         if st.button("Reconcile results (forecasts)"):
             ws = _open_logs_sheet(st.session_state.get("gsheet_id",""))
             _reconcile_logs(ws, exchange_id)
@@ -563,7 +547,7 @@ with tab_predict:
         base_fc = forecast_series(hist, periods, freq)
 
         news = latest_news(st.session_state["cp_token"], limit=100, _ttl_key=news_key)
-        b_coin = coin_bias(sym, news)             # −1..+1
+        b_coin = coin_bias(sym, news)
         b_disp = to_0_100(b_coin)
         w = float(st.session_state["sent_w"]); floor = float(st.session_state["bias_floor"])
         adj = 1.0 if abs(b_coin) < floor else (1.0 + float(np.tanh(b_coin))*w)
@@ -587,7 +571,6 @@ with tab_predict:
         st.metric("Coin sentiment (0–100)", f"{b_disp}")
         st.metric("Predicted change", f"{change_pct:+.2f}%")
 
-        # Log forecast to Google Sheets (optional)
         ws = _open_logs_sheet(st.session_state.get("gsheet_id",""))
         due_ts = (hist["ds"].iloc[-1] + pd.to_timedelta(periods*tf_to_minutes(tf), unit="m")).isoformat()
         _append_log(ws, {
