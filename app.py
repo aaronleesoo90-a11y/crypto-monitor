@@ -1,8 +1,8 @@
-# app.py — Crypto Monitoring System (polished UI + sentiment 0–100 + Predict tab)
+# app.py — Crypto Monitoring (polished UI, 0–100 sentiment, Predict tab)
 # Uses statsmodels ARIMA (no Prophet/pmdarima). Mobile/cloud friendly.
 
 from __future__ import annotations
-import warnings, re, time
+import warnings, re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -27,21 +27,16 @@ st.set_page_config(
 # Minimal CSS polish
 st.markdown("""
 <style>
-/* tighter layout */
 .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
-/* section headers */
 h1, h2, h3 { margin-top: .6rem; }
-/* card look */
 .card {
   border-radius: 16px; padding: 14px 16px; box-shadow: 0 6px 18px rgba(0,0,0,.06);
   border: 1px solid rgba(0,0,0,.05); background: #ffffff;
 }
-/* chip */
 .chip {display:inline-block; padding:4px 10px; border-radius:999px; font-size:.85rem; font-weight:600;}
 .chip.low{background:#e9f9ee; color:#127c38;}
 .chip.medium{background:#fff7e6; color:#a15b00;}
 .chip.high{background:#ffefef; color:#a11a1a;}
-/* table zebra + compact */
 .dataframe tbody tr:nth-child(odd) { background-color: rgba(0,0,0,.02); }
 .dataframe td, .dataframe th { padding: 6px 10px; font-size: 14px; }
 .smallnote {color:#6b7280; font-size:.85rem;}
@@ -75,25 +70,23 @@ def tf_to_pandas_freq(tf: str) -> str:
     return {"15m":"15min","1h":"H","4h":"4H"}.get(tf.lower().strip(), tf)
 
 def score_to_color(score: float) -> str:
-    # for tables: positive green, negative red
     return "badge-green" if score >= 0 else "badge-red"
 
 def risk_chip(bucket: str) -> str:
     b = bucket.lower()
-    cls = "low" if b == "low" else "medium" if b == "medium" else "high"
-    label = bucket.title()
-    return f'<span class="chip {cls}">{label}</span>'
+    cls = "low" if b=="low" else "medium" if b=="medium" else "high"
+    return f'<span class="chip {cls}">{bucket.title()}</span>'
 
 def to_0_100(signed: float) -> int:
-    # Rescale −1..+1 to 0..100 for display (does not change internal math)
+    # Display scale only; internal math stays −1..+1
     v = int(round((float(signed) + 1.0) * 50))
     return max(0, min(100, v))
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
     st.title("Settings")
-    exchange_id = st.text_input("Exchange id (ccxt)", value=st.session_state.get("exchange_id", "coinbase"))
-    quote = st.text_input("Quote currency", value=st.session_state.get("quote", "USDC"))
+    exchange_id = st.text_input("Exchange id (ccxt)", value=st.session_state.get("exchange_id","coinbase"))
+    quote = st.text_input("Quote currency", value=st.session_state.get("quote","USDC"))
     st.caption("Examples: coinbase or binance. Quote: USDC or USDT.")
 
     st.subheader("News API (optional)")
@@ -255,12 +248,13 @@ def auto_arima_statsmodels(y: pd.Series, max_p=3, max_d=2, max_q=3) -> Tuple[Tup
                 if p==q==0 and d==0: continue
                 try:
                     model=ARIMA(y, order=(p,d,q))
-                    res=model.fit(method="statespace", disp=False)
+                    res=model.fit()  # NOTE: plain .fit() for compat
                     if res.aic < (best_aic if best_aic is not None else np.inf):
                         best_aic=res.aic; best=(p,d,q); best_model=res
-                except: continue
+                except:
+                    continue
     if best_model is None:
-        best=(1,1,1); best_model=ARIMA(y, order=best).fit(method="statespace", disp=False)
+        best=(1,1,1); best_model=ARIMA(y, order=best).fit()
     return best, best_model
 
 def forecast_series(df_xy: pd.DataFrame, periods: int, freq: str) -> pd.DataFrame:
@@ -282,7 +276,7 @@ with tab_dash:
     st.markdown("## Dashboard")
     news = latest_news(cp_token, limit=80)
     global_bias = compute_sentiment_bias(news)
-    bias_display = to_0_100(global_bias)  # 0..100 for UI
+    bias_display = to_0_100(global_bias)
 
     c1,c2,c3 = st.columns([1,1,2])
     with c1:
@@ -294,7 +288,7 @@ with tab_dash:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.caption("Quick tips")
         st.write("• Try coinbase/USDC or binance/USDT")
-        st.write("• Pull‑to‑refresh via sidebar")
+        st.write("• Refresh via sidebar")
         st.markdown("</div>", unsafe_allow_html=True)
     with c3:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -348,7 +342,7 @@ with tab_dash:
 
     if rows:
         df = pd.DataFrame(rows).sort_values(["Risk","Score (0–100)"], ascending=[True, False]).reset_index(drop=True)
-        # Pretty HTML for risk + score color
+        # Pretty HTML
         df_display = df.copy()
         df_display["Risk"] = df_display["Risk"].map(risk_chip)
         df_display["Score (−1..+1)"] = df_display["Score (−1..+1)"].map(lambda s: f'<span class="{score_to_color(s)}">{s:+.3f}</span>')
@@ -359,7 +353,6 @@ with tab_dash:
         df_display["TP"] = df_display["TP"].map(fmt_num)
         df_display["SL"] = df_display["SL"].map(fmt_num)
         df_display["Dollar Volume"] = df_display["Dollar Volume"].map(usd)
-
         st.markdown(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
         st.caption("Scores: color shows bullish/bearish tilt. Risk chip uses ATR% and dollar volume.")
     else:
@@ -403,7 +396,6 @@ with tab_forecast:
         s = raw[["close"]].reset_index().rename(columns={"dt":"ds","close":"y"}).dropna()
         periods = {"15m":96, "1h":24, "4h":6}[tf]; freq = tf_to_pandas_freq(tf)
         fc = forecast_series(s, periods, freq)
-
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=s["ds"], y=s["y"], mode="lines", name="Actual"))
         fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat"], mode="lines", name="Forecast"))
@@ -431,24 +423,20 @@ with tab_predict:
         raw = fetch_ohlcv_df(exchange_id, sym, timeframe=tf, limit=600).copy()
         hist = raw[["close"]].reset_index().rename(columns={"dt":"ds","close":"y"}).dropna()
 
-        # Base forecast
         periods={"15m":96,"1h":24,"4h":6}[tf]; freq=tf_to_pandas_freq(tf)
         base_fc = forecast_series(hist, periods, freq)
 
-        # Sentiment
         news = latest_news(cp_token, limit=100)
-        bias_coin = coin_bias(sym, news)  # −1..+1
-        bias_display = to_0_100(bias_coin)  # for UI
+        bias_coin = coin_bias(sym, news)            # −1..+1 (internal)
+        bias_display = to_0_100(bias_coin)          # 0..100 (UI)
         bias_adj = 0.0 if abs(bias_coin) < bias_floor else float(np.tanh(bias_coin)) * sentiment_weight
 
-        # Adjust path
-        adj_factor = (1.0 + bias_adj)
+        adj = (1.0 + bias_adj)
         fc_adj = base_fc.copy()
-        fc_adj["yhat"] = base_fc["yhat"] * adj_factor
-        fc_adj["hi"]   = base_fc["hi"]   * adj_factor
-        fc_adj["lo"]   = base_fc["lo"]   * adj_factor
+        fc_adj["yhat"] = base_fc["yhat"] * adj
+        fc_adj["hi"]   = base_fc["hi"]   * adj
+        fc_adj["lo"]   = base_fc["lo"]   * adj
 
-        # Plot
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=hist["ds"], y=hist["y"], mode="lines", name="Actual"))
         fig.add_trace(go.Scatter(x=fc_adj["ds"], y=fc_adj["yhat"], mode="lines", name="Predicted"))
@@ -460,12 +448,12 @@ with tab_predict:
 
         last_price = float(hist["y"].iloc[-1])
         end_price  = float(fc_adj["yhat"].iloc[-1])
-        updn = (end_price/last_price - 1.0) * 100.0
+        change_pct = (end_price/last_price - 1.0) * 100.0
 
         c1,c2,c3 = st.columns(3)
         with c1: st.metric("Coin sentiment (0–100)", f"{bias_display}")
         with c2: st.metric("Applied shift", f"{bias_adj:+.2%}")
-        with c3: st.metric("Predicted change", f"{updn:+.2f}%")
+        with c3: st.metric("Predicted change", f"{change_pct:+.2f}%")
 
         with st.expander("Coin-related headlines used"):
             base = sym.split("/")[0].upper()
