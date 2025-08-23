@@ -1,2 +1,0 @@
-# crypto-monitor
-Sentiment Inspection 
