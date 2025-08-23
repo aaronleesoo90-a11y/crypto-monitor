@@ -1,26 +1,35 @@
-# app.py - Crypto Monitoring System (single file, ready for Streamlit Cloud)
+# app.py - Crypto Monitoring System (single file, Streamlit Cloud friendly)
+# Prophet removed. Forecast uses statsmodels ARIMA. No pmdarima builds needed.
 
 from __future__ import annotations
 import time
+import warnings
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional
 
-import streamlit as st
 import pandas as pd
 import numpy as np
-import ccxt, requests, feedparser
+import streamlit as st
+
+import ccxt
+import requests
+import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import ta
 import plotly.graph_objs as go
 
-st.set_page_config(page_title="Crypto Monitor", layout="wide", initial_sidebar_state="collapsed")
+# statsmodels ARIMA
+from statsmodels.tsa.arima.model import ARIMA
+warnings.filterwarnings("ignore")
 
-# Optional ARIMA forecast
-try:
-    from pmdarima import auto_arima
-except Exception:
-    auto_arima = None
+# -----------------------
+# Streamlit page settings
+# -----------------------
+st.set_page_config(page_title="Crypto Monitoring System", layout="wide", initial_sidebar_state="collapsed")
 
+# -----------------------
+# Utilities
+# -----------------------
 analyzer = SentimentIntensityAnalyzer()
 
 @dataclass
@@ -39,15 +48,16 @@ def format_num(x: float) -> str:
 
 def usd(x: float) -> str:
     try:
-        if x >= 1e9:
-            return f"${x/1e9:.2f}B"
-        if x >= 1e6:
-            return f"${x/1e6:.2f}M"
-        if x >= 1e3:
-            return f"${x/1e3:.2f}k"
+        if x >= 1e9: return f"${x/1e9:.2f}B"
+        if x >= 1e6: return f"${x/1e6:.2f}M"
+        if x >= 1e3: return f"${x/1e3:.2f}k"
         return f"${x:.2f}"
     except Exception:
         return "-"
+
+def tf_to_pandas_freq(tf: str) -> str:
+    tf = tf.lower().strip()
+    return {"15m": "15min", "1h": "H", "4h": "4H"}.get(tf, tf)
 
 # -----------------------
 # Sidebar settings
@@ -58,7 +68,7 @@ with st.sidebar:
     quote = st.text_input("Quote currency", value=st.session_state.get("quote", "USDC"))
     st.caption("Examples: coinbase or binance. Quote: USDC or USDT.")
 
-    st.subheader("News and API keys (optional)")
+    st.subheader("News keys (optional)")
     cryptopanic_token = st.text_input("CryptoPanic token", value=st.session_state.get("cp_token", ""), type="password")
 
     st.subheader("Refresh")
@@ -126,7 +136,7 @@ def fetch_ticker(ex_id: str, symbol: str) -> Dict:
     return ex.fetch_ticker(symbol)
 
 @st.cache_data(ttl=120, show_spinner=False)
-def latest_news(cryptopanic_token: str | None, limit: int = 60) -> List[Dict]:
+def latest_news(cryptopanic_token: Optional[str], limit: int = 60) -> List[Dict]:
     out = []
     if cryptopanic_token:
         try:
@@ -234,6 +244,54 @@ def size_position(capital: float, alloc_pct: float, price: float, fee_pct: float
     return {"budget": budget, "qty": qty, "est_fees": est_fees}
 
 # -----------------------
+# Simple ARIMA auto order search (statsmodels)
+# -----------------------
+def auto_arima_statsmodels(y: pd.Series, max_p: int = 3, max_d: int = 2, max_q: int = 3) -> Tuple[Tuple[int, int, int], ARIMA]:
+    """
+    Tiny grid search over (p,d,q) with AIC selection.
+    Keeps runtime light for mobile by limiting bounds.
+    """
+    best_aic = np.inf
+    best_order = None
+    best_model = None
+    y = pd.Series(y).astype(float)
+    y = y.replace([np.inf, -np.inf], np.nan).dropna()
+    for d in range(0, max_d + 1):
+        for p in range(0, max_p + 1):
+            for q in range(0, max_q + 1):
+                if p == q == 0 and d == 0:
+                    continue
+                try:
+                    model = ARIMA(y, order=(p, d, q))
+                    res = model.fit(method="statespace", disp=False)
+                    if res.aic < best_aic:
+                        best_aic = res.aic
+                        best_order = (p, d, q)
+                        best_model = res
+                except Exception:
+                    continue
+    if best_model is None:
+        # Fallback
+        best_model = ARIMA(y, order=(1, 1, 1)).fit(method="statespace", disp=False)
+        best_order = (1, 1, 1)
+    return best_order, best_model
+
+def forecast_statsmodels(df_xy: pd.DataFrame, periods: int, freq: str) -> pd.DataFrame:
+    s = df_xy[["ds", "y"]].dropna().sort_values("ds")
+    y = s["y"].astype(float).values
+    order, model = auto_arima_statsmodels(y)
+    fc = model.get_forecast(steps=periods)
+    conf = fc.conf_int(alpha=0.2)  # 80 percent band
+    idx = pd.date_range(s["ds"].iloc[-1], periods=periods + 1, freq=freq)[1:]
+    out = pd.DataFrame({
+        "ds": idx,
+        "yhat": fc.predicted_mean,
+        "yhat_lower": conf.iloc[:, 0].values,
+        "yhat_upper": conf.iloc[:, 1].values
+    })
+    return out
+
+# -----------------------
 # Layout: Tabs
 # -----------------------
 tab_dash, tab_live, tab_news, tab_forecast, tab_help = st.tabs(
@@ -243,7 +301,7 @@ tab_dash, tab_live, tab_news, tab_forecast, tab_help = st.tabs(
 # ---------- Dashboard ----------
 with tab_dash:
     st.title("Crypto Monitoring System")
-    st.caption("Market view, signals, and bracket guidance. Forecasting uses ARIMA for Windows stability.")
+    st.caption("Market view, signals, and ATR-based bracket guidance.")
 
     news_data = latest_news(cryptopanic_token if cryptopanic_token else None, limit=60)
     bias = compute_sentiment_bias(news_data)
@@ -265,7 +323,7 @@ with tab_dash:
     default_watch = [s for s in syms if any(x in s for x in ["BTC/", "ETH/", "SOL/"])][:5]
     watch = st.multiselect(f"Watchlist (quote {quote.upper()})", options=syms, default=default_watch)
 
-    # Overview chart on the first symbol
+    # Chart
     if watch:
         primary = watch[0]
         dfp = fetch_ohlcv_df(exchange_id, primary, "1h", 400)
@@ -279,7 +337,7 @@ with tab_dash:
         fig.update_layout(title=f"{primary} 1h chart", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Quick table
+    # Table
     rows = []
     for sym in watch:
         try:
@@ -292,38 +350,20 @@ with tab_dash:
             atr = float(dfi["atr"].iloc[-1])
             b = bracket_from_atr(entry=last, atr=atr, bucket=bucket)
             rows.append({
-                "symbol": sym,
-                "score": round(score, 3),
-                "bucket": bucket,
-                "price": last,
-                "atr": atr,
-                "atr_pct": float(dfi["atr_pct"].iloc[-1]),
-                "entry": b.entry,
-                "tp": b.tp,
-                "sl": b.sl,
-                "dollar_volume": dv
+                "symbol": sym, "score": round(score, 3), "bucket": bucket,
+                "price": last, "atr": atr, "atr_pct": float(dfi["atr_pct"].iloc[-1]),
+                "entry": b.entry, "tp": b.tp, "sl": b.sl, "dollar_volume": dv
             })
         except Exception as e:
             st.warning(f"{sym}: {e}")
 
     if rows:
         dfrows = pd.DataFrame(rows).sort_values(by=["bucket", "score"], ascending=[True, False])
-        show = dfrows.rename(columns={
-            "symbol": "symbol",
-            "score": "score (-1..+1)",
-            "bucket": "risk bucket",
-            "price": "last price",
-            "atr": "ATR",
-            "atr_pct": "ATR %",
-            "entry": "entry",
-            "tp": "take profit",
-            "sl": "stop loss",
-            "dollar volume": "dollar_volume"
-        })
-        st.dataframe(show, use_container_width=True)
+        st.dataframe(dfrows, use_container_width=True)
     else:
         st.info("Pick symbols to analyze.")
 
+    # Picks
     st.subheader("Top 3 picks and 24h guide")
     if rows:
         dfrows = pd.DataFrame(rows)
@@ -343,7 +383,6 @@ with tab_dash:
                     st.write(f"{r['symbol']} - score {r['score']:+.3f}")
                     st.write(f"Entry: {format_num(r['entry'])} | TP: {format_num(r['tp'])} | SL: {format_num(r['sl'])}")
                     st.write(f"Position: budget {usd(pos['budget'])}, qty ~ {format_num(pos['qty'])}, est fees {usd(pos['est_fees'])}")
-                    st.caption("Guideline: set brackets now, re-evaluate within 24 hours unless major bullish news.")
                 else:
                     st.write(f"**{b} Risk**")
                     st.caption("No candidate in this bucket right now.")
@@ -363,9 +402,7 @@ with tab_live:
     for sym in watch_live:
         try:
             t = fetch_ticker(exchange_id, sym)
-            last = float(t.get("last") or t.get("close") or 0)
-            chg = t.get("percentage")
-            rows.append({"symbol": sym, "last": last, "24h % (exchange)": chg})
+            rows.append({"symbol": sym, "last": float(t.get("last") or t.get("close") or 0), "24h %": t.get("percentage")})
         except Exception as e:
             st.warning(f"{sym}: {e}")
     if rows:
@@ -374,17 +411,16 @@ with tab_live:
 # ---------- News ----------
 with tab_news:
     st.title("News")
-    st.caption("Auto-updates via cache TTL or the Refresh now button.")
     data = list(latest_news(cryptopanic_token if cryptopanic_token else None, limit=60))
     bias_here = compute_sentiment_bias(data)
-    st.metric("Sentiment bias", f"{bias_here:+.3f}", help="Weighted average sentiment of recent headlines.")
+    st.metric("Sentiment bias", f"{bias_here:+.3f}")
     for n in data:
-        st.write(f"- [{n['title']}]({n['url']}) - sentiment {n['sentiment']:+.2f}")
+        st.write(f"- [{n['title']}]({n['url']}) - {n['sentiment']:+.2f}")
 
 # ---------- Forecast ----------
 with tab_forecast:
     st.title("Forecast")
-    st.caption("Editable data, optional outlier cleaning, and a 24 hour forecast with uncertainty bands (ARIMA).")
+    st.caption("Editable data, optional outlier cleaning, and ARIMA forecast with uncertainty bands.")
 
     try:
         syms = top_symbols_by_dollar_volume(exchange_id, quote, top_n=40)
@@ -400,53 +436,43 @@ with tab_forecast:
         working["y"] = working["price"]
 
         st.subheader("Data editor")
-        st.caption("Edit cells to fix bad ticks, then click Apply. You can add rows if needed.")
         edited = st.data_editor(working[["ds", "y"]], num_rows="dynamic", use_container_width=True, key="editdf")
         if st.button("Apply edits"):
             st.session_state["edited_series"] = edited.copy()
             st.success("Applied.")
         series = st.session_state.get("edited_series", edited)
 
-        clean = st.checkbox("Auto-clean outliers (Z-score on log returns)", value=True)
-        s = series.copy()
-        if clean:
-            s = s.sort_values("ds").reset_index(drop=True)
-            s["ret"] = np.log(s["y"]).diff()
-            z = (s["ret"] - s["ret"].mean()) / (s["ret"].std() + 1e-9)
-            s.loc[z.abs() > 5, "y"] = np.nan
-            s["y"] = s["y"].interpolate(limit_direction="both")
+        # Simple auto clean
+        s = series.sort_values("ds").reset_index(drop=True).copy()
+        s["y"] = pd.to_numeric(s["y"], errors="coerce")
+        s["ret"] = np.log(s["y"]).diff()
+        z = (s["ret"] - s["ret"].mean()) / (s["ret"].std() + 1e-9)
+        s.loc[z.abs() > 5, "y"] = np.nan
+        s["y"] = s["y"].interpolate(limit_direction="both")
+        s = s[["ds", "y"]].dropna()
 
-        st.subheader("Forecast chart")
-        if auto_arima is None:
-            st.error("pmdarima is not installed. Add 'pmdarima' to requirements.txt and install it.")
-        else:
-            try:
-                periods = 24 if tf == "1h" else (96 if tf == "15m" else 6)
-                freq = {"15m": "15min", "1h": "H", "4h": "4H"}[tf]
-                s2 = s[["ds", "y"]].dropna().sort_values("ds")
-                model = auto_arima(
-                    s2.set_index("ds")["y"],
-                    seasonal=False, stepwise=True, suppress_warnings=True, error_action="ignore"
-                )
-                idx = pd.date_range(s2["ds"].iloc[-1], periods=periods + 1, freq=freq)[1:]
-                fc, conf = model.predict(n_periods=periods, return_conf_int=True)
-                fcdf = pd.DataFrame({"ds": idx, "yhat": fc, "lo": conf[:, 0], "hi": conf[:, 1]})
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=s2["ds"], y=s2["y"], mode="lines", name="Actual"))
-                fig.add_trace(go.Scatter(x=fcdf["ds"], y=fcdf["yhat"], mode="lines", name="Forecast"))
-                fig.add_trace(go.Scatter(x=fcdf["ds"], y=fcdf["hi"], mode="lines", name="Upper", line=dict(dash="dot")))
-                fig.add_trace(go.Scatter(x=fcdf["ds"], y=fcdf["lo"], mode="lines", name="Lower", line=dict(dash="dot"), fill="tonexty"))
-                fig.update_layout(title=f"{sym} forecast (ARIMA)", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+        # Forecast
+        try:
+            periods = {"15m": 96, "1h": 24, "4h": 6}[tf]
+            freq = tf_to_pandas_freq(tf)
+            fc = forecast_statsmodels(s, periods=periods, freq=freq)
 
-                st.download_button(
-                    "Download cleaned series (CSV)",
-                    data=s2.to_csv(index=False),
-                    file_name=f"{sym.replace('/', '_')}_{tf}_clean.csv",
-                    mime="text/csv"
-                )
-            except Exception as e:
-                st.error(f"Forecast failed: {e}")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=s["ds"], y=s["y"], mode="lines", name="Actual"))
+            fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat"], mode="lines", name="Forecast"))
+            fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat_upper"], mode="lines", name="Upper", line=dict(dash="dot")))
+            fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat_lower"], mode="lines", name="Lower", line=dict(dash="dot"), fill="tonexty"))
+            fig.update_layout(title=f"{sym} forecast (ARIMA)", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.download_button(
+                "Download cleaned series (CSV)",
+                data=s.to_csv(index=False),
+                file_name=f"{sym.replace('/', '_')}_{tf}_clean.csv",
+                mime="text/csv"
+            )
+        except Exception as e:
+            st.error(f"Forecast failed: {e}")
 
 # ---------- How it works ----------
 with tab_help:
@@ -454,7 +480,7 @@ with tab_help:
     st.markdown("""
 **Inputs**
 - Market data: candles via CCXT
-- News: CryptoPanic (optional) and RSS feeds with sentiment analysis
+- News: CryptoPanic (optional) and RSS feeds with sentiment
 
 **Indicators**
 - SMA20 and SMA50, RSI14, Bollinger Bandwidth, ATR and ATR%
@@ -469,5 +495,5 @@ with tab_help:
 - Entry = last, TP and SL use Entry ± k × ATR (k by bucket)
 
 **Forecast**
-- Editable dataset, ARIMA forecast with uncertainty bands
+- ARIMA from statsmodels with a small AIC grid search over (p,d,q)
 """)
