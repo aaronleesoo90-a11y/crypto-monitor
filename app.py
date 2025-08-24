@@ -1,7 +1,7 @@
-# app.py - Crypto Monitor (enhanced): Assess Orders + OCR, News refresh, Order Book Signals, Sheets logging, and OB vs Returns chart
+# app.py — Crypto Monitor (enhanced): Assess Orders + OCR, News refresh, Order Book Signals, Sheets logging, and OB vs Returns chart
 
 from __future__ import annotations
-import time, re, warnings, json
+import os, time, re, warnings, json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -49,6 +49,14 @@ h1,h2,h3{margin-top:.6rem}
 # =================== Utils ===================
 analyzer = SentimentIntensityAnalyzer()
 
+def is_admin() -> bool:
+    try:
+        if st.secrets.get("admin_mode", False):
+            return True
+    except Exception:
+        pass
+    return str(os.environ.get("ADMIN_MODE", "0")).lower() in ("1", "true", "yes")
+
 @dataclass
 class Bracket:
     entry: float; tp: float; sl: float
@@ -91,9 +99,13 @@ with st.sidebar:
     st.subheader("News (optional)")
     cp_token = st.text_input("CryptoPanic token", value=st.session_state.get("cp_token",""), type="password")
 
-    st.subheader("Google Sheets (optional)")
-    sheet_id_input = st.text_input("Spreadsheet ID", value=st.session_state.get("gsheet_id",""))
-    st.caption("Put service account JSON in secrets as 'gsheets_service_account'. Share the Sheet with that client email.")
+    # Admin-only Google Sheets
+    if is_admin():
+        st.subheader("Google Sheets (optional)")
+        sheet_id_input = st.text_input("Spreadsheet ID", value=st.session_state.get("gsheet_id",""))
+        st.caption("Put service account JSON in secrets as 'gsheets_service_account'. Share the Sheet with that client email.")
+    else:
+        sheet_id_input = st.session_state.get("gsheet_id","")
 
     st.subheader("Advanced")
     with st.expander("Show advanced"):
@@ -392,21 +404,20 @@ news_key  = int(time.time() // max(1, st.session_state["news_ttl"]))
 with tab_overview:
     st.markdown("## Overview")
 
-    # Global sentiment
     news = latest_news(st.session_state["cp_token"], limit=80, _ttl_key=news_key)
     global_bias = compute_sentiment_bias(news)
 
     c1,c2 = st.columns([1,3])
     with c1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.metric("Sentiment (0-100)", f"{to_0_100(global_bias)}")
+        st.metric("Sentiment (0–100)", f"{to_0_100(global_bias)}")
         st.caption(f"Internal bias: {global_bias:+.3f}")
         st.markdown("</div>", unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.caption("Headlines (sample)")
+        st.caption("Headlines")
         for n in news[:6]:
-            st.write(f"- [{n['title']}]({n['url']}) - {to_0_100(n['sentiment'])}/100")
+            st.write(f"- [{n['title']}]({n['url']}) — {to_0_100(n['sentiment'])}/100")
         st.markdown("</div>", unsafe_allow_html=True)
 
     # Markets
@@ -441,8 +452,8 @@ with tab_overview:
             atr = float(dfi["atr"].iloc[-1]) if "atr" in dfi else np.nan
             rows.append({
                 "Symbol": sym,
-                "Score (-1..+1)": score,
-                "Score (0-100)": to_0_100(score),
+                "Score (−1..+1)": score,
+                "Score (0–100)": to_0_100(score),
                 "OBI": obi,
                 "Last": last,
                 "ATR": atr,
@@ -474,10 +485,10 @@ with tab_overview:
         def _colored(s: float) -> str:
             cls = "badge-pos" if s >= 0 else "badge-neg"
             return f'<span class="{cls}">{s:+.3f}</span>'
-        disp["Score (-1..+1)"] = df["Score (-1..+1)"].map(_colored)
+        disp["Score (−1..+1)"] = df["Score (−1..+1)"].map(_colored)
         disp["OBI"] = df["OBI"].map(lambda v: f"{v:+.2f}")
         disp["Dollar Volume"] = df["Dollar Volume"].map(usd)
-        disp = disp[["Symbol","Risk","Risk Score","Score (0-100)","Score (-1..+1)","OBI","Last","ATR","ATR %","Entry","TP","SL","Dollar Volume"]]
+        disp = disp[["Symbol","Risk","Risk Score","Score (0–100)","Score (−1..+1)","OBI","Last","ATR","ATR %","Entry","TP","SL","Dollar Volume"]]
         st.markdown(disp.to_html(escape=False, index=False), unsafe_allow_html=True)
 
         st.markdown("### Picks (top per bucket)")
@@ -490,12 +501,12 @@ with tab_overview:
                 if sub.empty:
                     st.caption("No candidate.")
                 else:
-                    r = sub.sort_values(["Score (0-100)","risk_score"], ascending=[False,True]).iloc[0]
+                    r = sub.sort_values(["Score (0–100)","risk_score"], ascending=[False,True]).iloc[0]
                     alloc = {"Low":st.session_state["alloc_low"],"Medium":st.session_state["alloc_med"],"High":st.session_state["alloc_high"]}[b]
                     budget = st.session_state["capital"] * (alloc/100.0)
                     qty = 0.0 if r["Last"]<=0 else budget/r["Last"]
                     fees = budget * (st.session_state["fee_pct"]/100.0)
-                    st.write(f"{r['Symbol']} - Score {int(r['Score (0-100)'])}/100, Risk {int(r['risk_score'])}/100, OBI {r['OBI']:+.2f}")
+                    st.write(f"{r['Symbol']} — Score {int(r['Score (0–100)'])}/100, Risk {int(r['risk_score'])}/100, OBI {r['OBI']:+.2f}")
                     st.write(f"Entry {fmt(r['Entry'])} • TP {fmt(r['TP'])} • SL {fmt(r['SL'])}")
                     st.caption(f"Budget {usd(budget)} • Qty ~ {fmt(qty)} • Est fees {usd(fees)}")
                     _append_log(ws, {
@@ -549,10 +560,10 @@ with tab_news:
         st.cache_data.clear()
     data = latest_news(st.session_state["cp_token"], limit=100, _ttl_key=news_key)
     bias_here = compute_sentiment_bias(data)
-    st.metric("Global Sentiment (0-100)", f"{to_0_100(bias_here)}")
+    st.metric("Global Sentiment (0–100)", f"{to_0_100(bias_here)}")
     st.metric("Bias (internal)", f"{bias_here:+.3f}")
     for n in data:
-        st.write(f"- [{n['title']}]({n['url']}) - {to_0_100(n['sentiment'])}/100")
+        st.write(f"- [{n['title']}]({n['url']}) — {to_0_100(n['sentiment'])}/100")
 
 # ---------- Predict (ARIMA + sentiment + logs chart) ----------
 COIN_ALIASES = {
@@ -569,7 +580,7 @@ def coin_bias(symbol: str, news_items: List[Dict]) -> float:
 
 with tab_predict:
     st.markdown("## Predict")
-    st.caption("ARIMA forecast plus a small shift from coin-specific sentiment. Sentiment shows as 0-100; math uses -1..+1.")
+    st.caption("ARIMA forecast plus a small shift from coin-specific sentiment. Sentiment shows as 0–100; math uses −1..+1.")
 
     try:
         syms = top_symbols_by_dollar_volume(exchange_id, quote, price_key, 40)
@@ -580,7 +591,7 @@ with tab_predict:
         sym = st.selectbox("Symbol", options=syms)
         tf  = st.selectbox("Timeframe", ["15m","1h","4h"], index=1)
     with right:
-        st.caption("Tune in sidebar: sentiment impact and bias floor")
+        st.caption("Tune in sidebar: sentiment impact & bias floor")
 
     if sym:
         raw = fetch_ohlcv_df(exchange_id, sym, timeframe=tf, limit=600, _ttl_key=price_key).copy()
@@ -605,13 +616,13 @@ with tab_predict:
         fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat"], mode="lines", name="Predicted"))
         fig.add_trace(go.Scatter(x=fc["ds"], y=fc["hi"],   mode="lines", name="Upper", line=dict(dash="dot")))
         fig.add_trace(go.Scatter(x=fc["ds"], y=fc["lo"],   mode="lines", name="Lower", line=dict(dash="dot"), fill="tonexty"))
-        fig.update_layout(title=f"{sym} {tf} - ARIMA + sentiment", xaxis_title="Time", yaxis_title="Price",
+        fig.update_layout(title=f"{sym} {tf} — ARIMA + sentiment", xaxis_title="Time", yaxis_title="Price",
                           margin=dict(l=10,r=10,t=36,b=8))
         st.plotly_chart(fig, use_container_width=True)
 
         last=float(hist["y"].iloc[-1]); end=float(fc["yhat"].iloc[-1])
         change_pct = (end/last - 1.0) * 100.0
-        st.metric("Coin sentiment (0-100)", f"{b_disp}")
+        st.metric("Coin sentiment (0–100)", f"{b_disp}")
         st.metric("Predicted change", f"{change_pct:+.2f}%")
 
         ws = _open_logs_sheet(st.session_state.get("gsheet_id",""))
@@ -631,7 +642,7 @@ with tab_predict:
             _reconcile_logs(ws, exchange_id)
             st.success("Reconciled (where due).")
 
-        # Historical OB imbalance vs realized returns (from Google Sheets logs)
+        # Historical OB imbalance vs realized returns
         st.markdown("### Signal quality: OB imbalance vs realized %")
         if ws is None:
             st.caption("Connect Google Sheets in the sidebar to enable this chart.")
@@ -658,7 +669,7 @@ with tab_predict:
                         fig2.add_trace(go.Bar(x=d_real["due_ts_utc"], y=d_real["realized_change_pct"], name="Realized %", opacity=0.45, yaxis="y2"))
                     fig2.update_layout(
                         xaxis_title="Time",
-                        yaxis=dict(title="Imbalance (-1..+1)"),
+                        yaxis=dict(title="Imbalance (−1..+1)"),
                         yaxis2=dict(title="Realized %", overlaying="y", side="right"),
                         margin=dict(l=10,r=10,t=30,b=8)
                     )
