@@ -10,3 +10,5 @@ plotly
 statsmodels
 gspread
 google-auth
+pytesseract
+pillow
