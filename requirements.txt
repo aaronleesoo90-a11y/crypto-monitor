@@ -12,3 +12,5 @@ gspread
 google-auth
 pytesseract
 pillow
+scikit-learn
+optuna
