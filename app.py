@@ -1,7 +1,7 @@
-# app.py — Crypto Monitor (enhanced): Assess Orders + OCR, News refresh, Order Book Signals, Sheets logging, and OB vs Returns chart
+# app.py — Crypto Monitor (ML+): Triple‑Barrier Predictor, OCR Assess Orders, OB Signals, Sheets Logging
 
 from __future__ import annotations
-import os, time, re, warnings, json
+import os, time, re, warnings, json, math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -17,6 +17,19 @@ from statsmodels.tsa.arima.model import ARIMA
 # OCR + image handling
 import pytesseract
 from PIL import Image
+
+# ML (predictor)
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
+
+# Optional tuner (fallback to grid if missing)
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception:
+    OPTUNA_AVAILABLE = False
 
 # Optional Google Sheets (graceful fallback)
 try:
@@ -82,15 +95,14 @@ def tf_to_minutes(tf: str) -> int:
     return {"15m":15, "1h":60, "4h":240}.get(tf.lower().strip(), 60)
 
 def to_0_100(signed: float) -> int:
-    v = int(round((float(signed)+1.0)*50))
-    return max(0, min(100, v))
+    v = int(round((float(signed)+1.0)*50)); return max(0, min(100, v))
 
 # =================== Sidebar ===================
 with st.sidebar:
     st.title("Settings")
-    exchange_id = st.text_input("Exchange", value=st.session_state.get("exchange_id","coinbase"))
-    quote = st.text_input("Quote", value=st.session_state.get("quote","USDC"))
-    st.caption("Tip: coinbase/USDC or binance/USDT")
+    exchange_id = st.text_input("Exchange", value=st.session_state.get("exchange_id","binance"))
+    quote = st.text_input("Quote", value=st.session_state.get("quote","USDT"))
+    st.caption("Tip: binance/USDT is robust for depth + OHLC.")
 
     st.subheader("Auto-refresh")
     rate = st.selectbox("Interval", ["Off","10s","30s","60s"], index=1)
@@ -393,8 +405,123 @@ def forecast_series(df_xy: pd.DataFrame, periods:int, freq:str) -> pd.DataFrame:
     idx = pd.date_range(s["ds"].iloc[-1], periods=periods+1, freq=freq)[1:]
     return pd.DataFrame({"ds":idx,"yhat":fc.predicted_mean,"lo":conf.iloc[:,0].values,"hi":conf.iloc[:,1].values})
 
+# =================== ML+ Predictor helpers ===================
+def make_features_ml(df: pd.DataFrame, obi_series: Optional[pd.Series]=None) -> pd.DataFrame:
+    d = df.copy()
+    d["ret1"] = d["close"].pct_change()
+    for k in [2,3,5,8,13,21]:
+        d[f"ret{k}"] = d["close"].pct_change(k)
+    d["sma_fast"] = d["close"].rolling(12).mean()
+    d["sma_slow"] = d["close"].rolling(48).mean()
+    d["sma_gap"]  = (d["sma_fast"]/d["sma_slow"] - 1.0)
+    d["rsi14"]    = ta.momentum.RSIIndicator(d["close"], 14).rsi()
+    bb = ta.volatility.BollingerBands(d["close"], 20, 2)
+    d["bb_bw"]    = (bb.bollinger_hband()-bb.bollinger_lband())/d["close"]
+    atr = ta.volatility.AverageTrueRange(d["high"], d["low"], d["close"], 14)
+    d["atr"]      = atr.average_true_range()
+    d["atr_pct"]  = d["atr"]/d["close"]
+    if obi_series is not None:
+        d["obi"] = obi_series.reindex(d.index).ffill().bfill()
+    else:
+        d["obi"] = 0.0
+    d = d.dropna()
+    return d
+
+def triple_barrier_labels(df: pd.DataFrame, horizon: int = 24, k_tp: float = 2.0, k_sl: float = 1.2) -> pd.DataFrame:
+    """
+    Label with first barrier hit within horizon bars:
+        upper = entry + k_tp * ATR_t
+        lower = entry - k_sl * ATR_t
+    If neither hit, sign of return at horizon.
+    """
+    d = df.copy()
+    if not {"close","high","low","atr"}.issubset(d.columns):
+        raise ValueError("df must include close, high, low, atr columns")
+    n = len(d)
+    label = np.zeros(n)
+    fwd_ret = np.zeros(n)
+    hit_idx = np.full(n, np.nan)
+    closes = d["close"].values
+    highs  = d["high"].values
+    lows   = d["low"].values
+    atrs   = d["atr"].values
+
+    for i in range(n):
+        up = closes[i] + k_tp * atrs[i]
+        dn = closes[i] - k_sl * atrs[i]
+        end = min(n-1, i + horizon)
+        first_hit = np.nan
+        # scan forward
+        for j in range(i+1, end+1):
+            if highs[j] >= up:
+                label[i] = 1.0
+                fwd_ret[i] = (up / closes[i]) - 1.0
+                first_hit = j
+                break
+            if lows[j] <= dn:
+                label[i] = -1.0
+                fwd_ret[i] = (dn / closes[i]) - 1.0
+                first_hit = j
+                break
+        if np.isnan(first_hit):
+            # time out: use end-of-horizon return
+            fwd_ret[i] = (closes[end] / closes[i]) - 1.0
+            label[i] = 1.0 if fwd_ret[i] > 0 else 0.0  # 1 for up / 0 for not-up
+            first_hit = end
+        hit_idx[i] = first_hit
+
+    out = d.copy()
+    out["fwd_ret"] = fwd_ret
+    out["fwd_up"]  = (label > 0).astype(int)
+    out["hit_idx"] = hit_idx
+    # drop tail rows without horizon lookahead
+    out = out.iloc[:-horizon] if horizon > 0 else out
+    return out
+
+def purged_splits(X: pd.DataFrame, n_splits: int = 4, embargo_frac: float = 0.01):
+    """
+    Build purged walk-forward splits on time index.
+    Embargo removes last fraction of the training set close to the test start.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    m = len(X)
+    embargo = max(1, int(m * embargo_frac))
+    for tr_idx, te_idx in tscv.split(X):
+        # purge tail of training near test start
+        tr_end = max(0, tr_idx[-1] - embargo)
+        tr = tr_idx[:tr_end] if tr_end > 0 else tr_idx
+        yield tr, te_idx
+
+def annualization_factor(tf: str) -> float:
+    """Rough annualization factor for Sharpe given timeframe."""
+    per_day = {"15m": 96/4, "1h": 24, "4h": 6}.get(tf, 24)
+    return math.sqrt(252 * per_day)
+
+def sharpe_of_strategy(proba_up: np.ndarray, realized: np.ndarray, threshold: float,
+                       fee_bps: float = 5.0, slippage_bps: float = 5.0, ann_factor: float = math.sqrt(252)) -> float:
+    picks = (proba_up > threshold).astype(int)
+    cost = (fee_bps + slippage_bps) / 10000.0
+    pnl = picks * realized - picks * cost
+    s = np.std(pnl)
+    return 0.0 if s < 1e-12 else float(np.mean(pnl) / s * ann_factor)
+
+def optimize_threshold(proba: np.ndarray, realized: np.ndarray, fee_bps: float, slip_bps: float, ann_factor: float) -> float:
+    if OPTUNA_AVAILABLE:
+        def objective(trial):
+            t = trial.suggest_float("t", 0.50, 0.70)
+            return -sharpe_of_strategy(proba, realized, t, fee_bps, slip_bps, ann_factor)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=40, show_progress_bar=False)
+        return float(study.best_params["t"])
+    # fallback grid
+    grid = np.linspace(0.50, 0.70, 21)
+    scores = [sharpe_of_strategy(proba, realized, t, fee_bps, slip_bps, ann_factor) for t in grid]
+    return float(grid[int(np.argmax(scores))])
+
 # =================== Tabs ===================
-tab_overview, tab_live, tab_news, tab_predict, tab_orders = st.tabs(["Overview","Live","News","Predict","Assess Orders"])
+tab_overview, tab_live, tab_news, tab_predict, tab_ml, tab_orders = st.tabs(
+    ["Overview","Live","News","Predict (ARIMA)","Predictor (ML+)","Assess Orders"]
+)
 
 # cache-busters
 price_key = int(time.time() // max(1, st.session_state["price_ttl"]))
@@ -420,7 +547,6 @@ with tab_overview:
             st.write(f"- [{n['title']}]({n['url']}) — {to_0_100(n['sentiment'])}/100")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Markets
     try:
         syms = top_symbols_by_dollar_volume(exchange_id, quote, price_key, 40)
     except Exception as e:
@@ -428,7 +554,6 @@ with tab_overview:
     default_watch = [s for s in syms if any(x in s for x in ["BTC/","ETH/","SOL/"])][:5]
     watch = st.multiselect(f"Watchlist ({quote.upper()})", options=syms, default=default_watch)
 
-    # Chart
     if watch:
         primary = watch[0]
         ind = compute_indicators(fetch_ohlcv_df(exchange_id, primary, "1h", 400, price_key))
@@ -439,7 +564,6 @@ with tab_overview:
         fig.update_layout(title=f"{primary} 1h", xaxis_title="Time", yaxis_title="Price", margin=dict(l=10,r=10,t=36,b=8))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Table
     rows=[]
     for sym in watch:
         try:
@@ -565,7 +689,7 @@ with tab_news:
     for n in data:
         st.write(f"- [{n['title']}]({n['url']}) — {to_0_100(n['sentiment'])}/100")
 
-# ---------- Predict (ARIMA + sentiment + logs chart) ----------
+# ---------- Predict (ARIMA) ----------
 COIN_ALIASES = {
     "BTC":["btc","bitcoin"], "ETH":["eth","ethereum"], "SOL":["sol","solana"],
     "XRP":["xrp","ripple"], "ADA":["ada","cardano"], "DOGE":["doge","dogecoin"]
@@ -579,7 +703,7 @@ def coin_bias(symbol: str, news_items: List[Dict]) -> float:
     return compute_sentiment_bias(filt)
 
 with tab_predict:
-    st.markdown("## Predict")
+    st.markdown("## Predict (ARIMA)")
     st.caption("ARIMA forecast plus a small shift from coin-specific sentiment. Sentiment shows as 0–100; math uses −1..+1.")
 
     try:
@@ -642,7 +766,7 @@ with tab_predict:
             _reconcile_logs(ws, exchange_id)
             st.success("Reconciled (where due).")
 
-        # Historical OB imbalance vs realized returns
+        # OB imbalance vs realized returns
         st.markdown("### Signal quality: OB imbalance vs realized %")
         if ws is None:
             st.caption("Connect Google Sheets in the sidebar to enable this chart.")
@@ -679,10 +803,155 @@ with tab_predict:
             except Exception as e:
                 st.caption(f"Could not read logs: {e}")
 
+# ---------- Predictor (ML+) ----------
+with tab_ml:
+    st.markdown("## Predictor (ML+)")
+    st.caption("Supervised model with triple‑barrier labels, purged walk‑forward CV, probability calibration, and Sharpe‑optimal threshold.")
+
+    try:
+        syms = top_symbols_by_dollar_volume(exchange_id, quote, price_key, 40)
+    except Exception as e:
+        st.error(f"Load markets failed: {e}"); syms=[]
+
+    colA, colB, colC, colD = st.columns([2,1,1,1])
+    with colA:
+        sym_ml = st.selectbox("Symbol", options=syms, key="ml_sym")
+        tf_ml  = st.selectbox("Timeframe", ["15m","1h","4h"], index=1, key="ml_tf")
+    with colB:
+        horizon_bars = st.number_input("Max horizon (bars)", 1, 256, 24,
+                                       help="Maximum bars to look ahead for barrier hits.")
+        k_tp = st.number_input("TP (× ATR)", 0.5, 5.0, 2.0, step=0.1)
+        k_sl = st.number_input("SL (× ATR)", 0.5, 5.0, 1.2, step=0.1)
+    with colC:
+        n_splits = st.slider("Walk‑forward splits", 2, 8, 4)
+        embargo = st.slider("Embargo (train tail %)", 0.0, 5.0, 1.0, step=0.5)
+    with colD:
+        fee_bps = st.number_input("Fee (bps)", 0.0, 50.0, 10.0, help="Round‑trip fees in basis points.")
+        slip_bps = st.number_input("Slippage (bps)", 0.0, 50.0, 10.0)
+
+    if sym_ml:
+        raw = fetch_ohlcv_df(exchange_id, sym_ml, timeframe=tf_ml, limit=1200, _ttl_key=price_key)
+        if len(raw) < (horizon_bars + 200):
+            st.warning("Not enough history for ML+. Try a longer timeframe or different market.")
+        else:
+            # OB imbalance sampled at candle timestamps (simple hold-last)
+            try:
+                obi_val = order_book_imbalance(exchange_id, sym_ml, _ttl_key=price_key)
+            except Exception:
+                obi_val = 0.0
+            obi_series = pd.Series([obi_val]*len(raw), index=raw.index)
+
+            feat = make_features_ml(raw, obi_series=obi_series)
+            lab  = triple_barrier_labels(feat, horizon=int(horizon_bars), k_tp=float(k_tp), k_sl=float(k_sl))
+            colsX = ["ret1","ret2","ret3","ret5","ret8","ret13","ret21","sma_gap","rsi14","bb_bw","atr_pct","obi"]
+            X = lab[colsX].copy()
+            y_cls = lab["fwd_up"].astype(int).copy()
+            y_reg = lab["fwd_ret"].astype(float).copy()
+            ann = annualization_factor(tf_ml)
+
+            accs, f1s, rocs, sharpes, thresholds = [], [], [], [], []
+            all_val = []
+            # Walk‑forward with purge
+            for tr_idx, te_idx in purged_splits(X, n_splits=int(n_splits), embargo_frac=float(embargo)/100.0):
+                Xtr, Xte = X.iloc[tr_idx], X.iloc[te_idx]
+                ytr_c, yte_c = y_cls.iloc[tr_idx], y_cls.iloc[te_idx]
+                ytr_r, yte_r = y_reg.iloc[tr_idx], y_reg.iloc[te_idx]
+
+                clf = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.08)
+                reg = HistGradientBoostingRegressor(max_depth=3, learning_rate=0.08)
+                clf.fit(Xtr, ytr_c); reg.fit(Xtr, ytr_r)
+
+                # Calibrate on the same validation block (Platt)
+                try:
+                    cal = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
+                    cal.fit(Xte, yte_c)
+                    proba = cal.predict_proba(Xte)[:,1]
+                except Exception:
+                    proba = clf.predict_proba(Xte)[:,1]
+
+                # Optimize threshold for Sharpe
+                t_opt = optimize_threshold(proba, yte_r.values, fee_bps, slip_bps, ann)
+                thresholds.append(t_opt)
+                S = sharpe_of_strategy(proba, yte_r.values, t_opt, fee_bps, slip_bps, ann)
+                sharpes.append(S)
+
+                accs.append(accuracy_score(yte_c, (proba>0.5).astype(int)))
+                f1s.append(f1_score(yte_c, (proba>0.5).astype(int)))
+                try:
+                    rocs.append(roc_auc_score(yte_c, proba))
+                except Exception:
+                    rocs.append(np.nan)
+
+                all_val.append(pd.DataFrame({"ds": Xte.index, "proba_up": proba, "realized": yte_r.values}))
+
+            st.write("### Walk‑forward results")
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("Accuracy", f"{np.nanmean(accs)*100:,.1f}%")
+            c2.metric("F1", f"{np.nanmean(f1s):.3f}")
+            c3.metric("ROC‑AUC", f"{np.nanmean(rocs):.3f}")
+            c4.metric("Sharpe (cv)", f"{np.nanmean(sharpes):.2f}")
+            c5.metric("Avg threshold", f"{np.nanmean(thresholds):.3f}")
+
+            # Train on full data, predict next bar
+            clfF = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.08)
+            regF = HistGradientBoostingRegressor(max_depth=3, learning_rate=0.08)
+            clfF.fit(X, y_cls); regF.fit(X, y_reg)
+
+            # Calibrate on last 10% as holdout
+            split_i = int(max(10, 0.9*len(X)))
+            X_hold, y_hold = X.iloc[split_i:], y_cls.iloc[split_i:]
+            try:
+                calF = CalibratedClassifierCV(clfF, method="sigmoid", cv="prefit")
+                calF.fit(X_hold, y_hold)
+                p_up = float(calF.predict_proba(X.tail(1))[:,1][0])
+            except Exception:
+                p_up = float(clfF.predict_proba(X.tail(1))[:,1][0])
+
+            r_hat = float(regF.predict(X.tail(1))[0])
+
+            # Choose production threshold
+            t_prod = float(np.nanmean(thresholds)) if len(thresholds) else 0.55
+
+            st.write("### Next‑bar prediction")
+            st.metric("P(up)", f"{p_up*100:,.1f}%")
+            st.metric("Expected return", f"{r_hat*100:+.2f}%")
+            st.caption(f"Production threshold ≈ {t_prod:.3f} (Sharpe‑optimal from CV)")
+
+            # Plot validation preds
+            if all_val:
+                dfp = pd.concat(all_val).sort_values("ds").tail(600)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=dfp["ds"], y=dfp["proba_up"], name="P(up)", mode="lines"))
+                fig.add_trace(go.Bar(x=dfp["ds"], y=dfp["realized"], name="Realized fwd %", opacity=0.4, yaxis="y2"))
+                fig.update_layout(
+                    xaxis_title="Time",
+                    yaxis=dict(title="P(up)"),
+                    yaxis2=dict(title="Realized fwd return", overlaying="y", side="right"),
+                    margin=dict(l=10,r=10,t=30,b=8)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Optional log to Sheets (store proba in sentiment_bias field; expected % in pred_change_pct)
+            ws = _open_logs_sheet(st.session_state.get("gsheet_id",""))
+            if ws is not None:
+                last_price = float(raw["close"].iloc[-1])
+                _append_log(ws, {
+                    "ts_utc": pd.Timestamp.utcnow().isoformat(),
+                    "kind": "forecast_ml",
+                    "symbol": sym_ml, "timeframe": tf_ml, "last_price": last_price,
+                    "horizon_steps": int(horizon_bars), "horizon_tf": tf_ml,
+                    "pred_end_price": "", "pred_change_pct": r_hat*100.0,
+                    "sentiment_bias": p_up,  # storing proba here to avoid schema change
+                    "orderbook_imbalance": order_book_imbalance(exchange_id, sym_ml, _ttl_key=price_key),
+                    "risk_bucket": "",
+                    "entry": "", "tp": "", "sl": "",
+                    "due_ts_utc": "", "status":"", "actual_price":"", "realized_change_pct":"", "correct":""
+                })
+
 # ---------- Assess Orders ----------
 with tab_orders:
     st.markdown("## Assess Open Orders")
-    st.caption("Upload a file or screenshot of your open orders. We validate TP/SL against ATR-based brackets and show order book context.")
+    st.caption("Upload a file or screenshot of your open orders. We validate TP/SL against ATR‑based brackets and show order book context.")
 
     mode = st.radio("Upload type", ["File (CSV/Excel)", "Screenshot (PNG/JPG)"])
 
